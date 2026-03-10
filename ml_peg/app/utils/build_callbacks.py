@@ -8,7 +8,7 @@ import io
 import json
 import math
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from dash import Input, Output, State, callback, callback_context, html
 from dash.dcc import Graph
@@ -17,12 +17,14 @@ from dash.exceptions import PreventUpdate
 from dash.html import Div, Iframe
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from ml_peg.analysis.utils.decorators import (
     PERIODIC_TABLE_COLS,
     PERIODIC_TABLE_POSITIONS,
     PERIODIC_TABLE_ROWS,
 )
+from ml_peg.app.utils.plot_helpers import apply_symlog_yaxis, symlog_transform
 from ml_peg.app.utils.weas import generate_weas_html
 
 
@@ -785,3 +787,267 @@ def model_asset_from_scatter(
         if rendered is None:
             return html.Div(missing_message)
         return rendered
+
+
+# Default colour palette for multi-trace curve overlays.
+_CURVE_PALETTE = [
+    "royalblue",
+    "firebrick",
+    "seagreen",
+    "darkorange",
+    "mediumpurple",
+    "deeppink",
+    "teal",
+    "goldenrod",
+    "slategray",
+    "crimson",
+]
+
+
+def register_curve_gallery_callbacks(
+    *,
+    model_dropdown_id: str,
+    group_dropdown_id: str,
+    figure_id: str,
+    curve_dir: str | Path,
+    group_fn: Callable[[str], str],
+    subplot_specs: list[dict[str, Any]],
+    palette: list[str] | None = None,
+    struct_container_id: str | None = None,
+    struct_asset_prefix: str | None = None,
+) -> None:
+    """
+    Register callbacks for an interactive curve explorer with optional symlog y-axes.
+
+    Curve JSON payloads are expected under ``curve_dir/<model>/<label>.json``.
+    Each payload is a dict whose keys correspond to the ``x_key`` / ``y_key``
+    fields in *subplot_specs*.
+
+    Parameters
+    ----------
+    model_dropdown_id
+        Dash component ID for the model selector dropdown.
+    group_dropdown_id
+        Dash component ID for the group selector dropdown.
+    figure_id
+        Dash component ID for the output ``dcc.Graph``.
+    curve_dir
+        Root directory containing ``<model>/<structure>.json`` curve files.
+    group_fn
+        Callable mapping a curve filename stem (e.g. ``"C2H4_pyxtal_0"``) to
+        a group label (e.g. ``"CH2"``).  All structures within a group are
+        overlaid on the same axes.
+    subplot_specs
+        List of dicts, one per subplot row, each with keys:
+
+        * ``title`` (str) – subplot title
+        * ``x_key`` (str) – JSON payload key for x values
+        * ``y_key`` (str) – JSON payload key for y values
+        * ``y_transform`` (callable, optional) – applied to each raw y value
+          before plotting (e.g. unit conversion).
+        * ``y_label`` (str) – y-axis title
+        * ``x_label`` (str, optional) – x-axis title (shown on lowest subplot)
+        * ``trace_prefix`` (str, optional) – legend prefix (defaults to
+          ``y_key``).
+        * ``hover_y_fmt`` (str, optional) – format spec for hover y value
+          (default ``".4f"``).
+        * ``hover_y_unit`` (str, optional) – unit shown in hover tooltip.
+        * ``symlog`` (dict, optional) – if present, y-axis uses symlog with
+          keys ``linthresh``, ``decades`` (default 4), ``linear_frac``
+          (default 0.6).
+    palette
+        Colour list for traces.  Falls back to a built-in 10-colour palette.
+    struct_container_id
+        Dash component ID for the structure display ``Div``.  When provided
+        together with *struct_asset_prefix*, clicking a trace point renders
+        the equilibrium structure.  Structure files are expected at
+        ``<curve_dir>/<model>/<label>.xyz``.
+    struct_asset_prefix
+        URL prefix used to serve ``.xyz`` files as Dash assets, e.g.
+        ``"assets/physicality/compression/curves"``.
+    """
+    curve_base = Path(curve_dir)
+    colors = palette or _CURVE_PALETTE
+
+    def _available_groups(model_name: str) -> list[str]:
+        model_dir = curve_base / model_name
+        if not model_dir.exists():
+            return []
+        groups: set[str] = set()
+        for p in model_dir.glob("*.json"):
+            groups.add(group_fn(p.stem))
+        return sorted(groups)
+
+    def _load_group_curves(
+        model_name: str, group: str
+    ) -> list[tuple[str, dict]]:
+        model_dir = curve_base / model_name
+        if not model_dir.exists():
+            return []
+        results: list[tuple[str, dict]] = []
+        for p in sorted(model_dir.glob("*.json")):
+            if group_fn(p.stem) == group:
+                try:
+                    with p.open(encoding="utf8") as fh:
+                        results.append((p.stem, json.load(fh)))
+                except Exception:
+                    continue
+        return results
+
+    @callback(
+        Output(group_dropdown_id, "options"),
+        Output(group_dropdown_id, "value"),
+        Input(model_dropdown_id, "value"),
+    )
+    def _update_group_options(model_name: str):
+        if not model_name:
+            raise PreventUpdate
+        groups = _available_groups(model_name)
+        options = [{"label": g, "value": g} for g in groups]
+        default = groups[0] if groups else None
+        return options, default
+
+    @callback(
+        Output(figure_id, "figure"),
+        Input(model_dropdown_id, "value"),
+        Input(group_dropdown_id, "value"),
+    )
+    def _update_figure(model_name: str, group_value: str | None):
+        if not model_name or not group_value:
+            raise PreventUpdate
+
+        curves = _load_group_curves(model_name, group_value)
+        if not curves:
+            raise PreventUpdate
+
+        n_rows = len(subplot_specs)
+        fig = make_subplots(
+            rows=n_rows,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=[s["title"] for s in subplot_specs],
+        )
+
+        for idx, (label, payload) in enumerate(curves):
+            color = colors[idx % len(colors)]
+
+            for row_idx, spec in enumerate(subplot_specs, start=1):
+                x_vals = payload.get(spec["x_key"], [])
+                y_vals = payload.get(spec["y_key"], [])
+                if not x_vals or not y_vals:
+                    continue
+
+                y_transform = spec.get("y_transform")
+                if y_transform is not None:
+                    y_vals = [y_transform(v) for v in y_vals]
+
+                symlog_cfg = spec.get("symlog")
+                if symlog_cfg:
+                    y_plot = symlog_transform(
+                        y_vals,
+                        linthresh=symlog_cfg.get("linthresh", 10.0),
+                        linear_frac=symlog_cfg.get("linear_frac", 0.6),
+                        decades=symlog_cfg.get("decades", 4),
+                    )
+                else:
+                    y_plot = y_vals
+
+                hover_fmt = spec.get("hover_y_fmt", ".4f")
+                hover_unit = spec.get("hover_y_unit", "")
+                prefix = spec.get("trace_prefix", spec["y_key"])
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_vals,
+                        y=y_plot,
+                        mode="lines+markers",
+                        name=f"{prefix} — {label}",
+                        line={"color": color},
+                        marker={"size": 3},
+                        legendgroup=label,
+                        showlegend=(row_idx == 1),
+                        customdata=y_vals,
+                        hovertemplate=(
+                            f"{spec['x_key']}: %{{x:.3f}}<br>"
+                            f"{spec['y_key']}: %{{customdata:{hover_fmt}}} "
+                            f"{hover_unit}<extra></extra>"
+                        ),
+                    ),
+                    row=row_idx,
+                    col=1,
+                )
+
+        for row_idx, spec in enumerate(subplot_specs, start=1):
+            symlog_cfg = spec.get("symlog")
+            if symlog_cfg:
+                apply_symlog_yaxis(
+                    fig,
+                    linthresh=symlog_cfg.get("linthresh", 10.0),
+                    decades=symlog_cfg.get("decades", 4),
+                    linear_frac=symlog_cfg.get("linear_frac", 0.6),
+                    title_text=spec.get("y_label", ""),
+                    row=row_idx,
+                    col=1,
+                )
+            else:
+                fig.update_yaxes(
+                    title_text=spec.get("y_label", ""), row=row_idx, col=1
+                )
+
+        bottom_x_label = subplot_specs[-1].get("x_label", "")
+        if bottom_x_label:
+            fig.update_xaxes(title_text=bottom_x_label, row=n_rows, col=1)
+
+        fig.update_layout(
+            title=f"{model_name} — {group_value}",
+            height=350 * n_rows,
+            showlegend=True,
+            template="plotly_white",
+        )
+
+        return fig
+
+    # Optional structure visualisation on trace click --------------------------
+    if struct_container_id and struct_asset_prefix:
+
+        @callback(
+            Output(struct_container_id, "children"),
+            Input(figure_id, "clickData"),
+            State(figure_id, "figure"),
+            State(model_dropdown_id, "value"),
+            prevent_initial_call=True,
+        )
+        def _show_structure(click_data, figure_data, model_name):
+            """Display the equilibrium structure for the clicked trace."""
+            if not click_data or not figure_data or not model_name:
+                raise PreventUpdate
+
+            curve_number = click_data["points"][0].get("curveNumber")
+            if curve_number is None:
+                raise PreventUpdate
+
+            traces = figure_data.get("data", [])
+            if curve_number >= len(traces):
+                raise PreventUpdate
+
+            trace_name = traces[curve_number].get("name", "")
+            # Trace names follow the pattern "prefix — label"
+            parts = trace_name.split(" \u2014 ", 1)
+            if len(parts) != 2:
+                raise PreventUpdate
+            label = parts[1]
+
+            struct_path = f"{struct_asset_prefix}/{model_name}/{label}.xyz"
+
+            return Div(
+                Iframe(
+                    srcDoc=generate_weas_html(struct_path, mode="struct"),
+                    style={
+                        "height": "550px",
+                        "width": "100%",
+                        "border": "1px solid #ddd",
+                        "borderRadius": "5px",
+                    },
+                )
+            )

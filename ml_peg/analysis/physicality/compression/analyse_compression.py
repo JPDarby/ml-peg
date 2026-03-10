@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from ase.io import read as ase_read
+from ase.io import write as ase_write
 from scipy.signal import find_peaks
 
 from ml_peg.analysis.utils.decorators import build_table
@@ -307,6 +309,53 @@ def _write_curve_payloads(
             json.dump(payload, fh)
 
 
+def _write_structure_assets(
+    curve_dir: Path, model_name: str, frame: pd.DataFrame
+) -> None:
+    """
+    Write equilibrium structure ``.xyz`` files from calc trajectories.
+
+    For each unique structure in *frame*, the calc trajectory is read
+    and the frame closest to ``scale == 1.0`` is written as a single
+    ``.xyz`` alongside the JSON curve payload.
+
+    Parameters
+    ----------
+    curve_dir
+        Base directory for curve output files.
+    model_name
+        Name of the model.
+    frame
+        Per-model compression dataframe.
+    """
+    model_curve_dir = curve_dir / model_name
+    model_curve_dir.mkdir(parents=True, exist_ok=True)
+    traj_dir = CALC_PATH / model_name / "compression"
+
+    for struct_label in frame["structure"].unique():
+        out_path = model_curve_dir / f"{struct_label}.xyz"
+        if out_path.exists():
+            continue
+        traj_path = traj_dir / f"{struct_label}.xyz"
+        if not traj_path.exists():
+            continue
+        try:
+            trajectory = ase_read(str(traj_path), index=":", format="extxyz")
+        except Exception:
+            continue
+
+        # Pick the frame closest to scale = 1.0
+        best_idx = 0
+        best_diff = float("inf")
+        for i, atoms in enumerate(trajectory):
+            diff = abs(atoms.info.get("scale", 1.0) - 1.0)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+
+        ase_write(str(out_path), trajectory[best_idx], format="extxyz")
+
+
 def persist_compression_data() -> dict[str, pd.DataFrame]:
     """
     Persist curve payloads and return per-model dataframes.
@@ -321,6 +370,7 @@ def persist_compression_data() -> dict[str, pd.DataFrame]:
     for model_name, frame in data.items():
         if frame is not None and not frame.empty:
             _write_curve_payloads(CURVE_PATH, model_name, frame)
+            _write_structure_assets(CURVE_PATH, model_name, frame)
     return data
 
 

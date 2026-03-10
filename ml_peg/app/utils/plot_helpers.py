@@ -10,6 +10,138 @@ import numpy as np
 import plotly.graph_objects as go
 
 
+# ---------------------------------------------------------------------------
+# Symlog helpers
+# ---------------------------------------------------------------------------
+
+
+def symlog_transform(
+    values: Sequence[float] | np.ndarray,
+    linthresh: float = 10.0,
+    linear_frac: float = 0.6,
+    decades: int = 4,
+) -> list[float]:
+    """
+    Apply a symmetric-log transform to *values*.
+
+    Linear within ``[-linthresh, linthresh]``, logarithmic outside.
+    The linear region is scaled so that it occupies *linear_frac* of the
+    total axis range (assuming *decades* log decades on each side).
+
+    Parameters
+    ----------
+    values
+        Raw data values.
+    linthresh
+        Linear threshold.
+    linear_frac
+        Fraction of the full axis height reserved for the linear region.
+    decades
+        Number of log decades shown on each side.
+
+    Returns
+    -------
+    list[float]
+        Transformed values.
+    """
+    lin_half = linear_frac / 2.0
+    log_scale = (1.0 - linear_frac) / (2.0 * max(decades, 1))
+
+    arr = np.asarray(values, dtype=float)
+    out = np.where(
+        np.abs(arr) <= linthresh,
+        lin_half * arr / linthresh,
+        np.sign(arr)
+        * (lin_half + log_scale * np.log10(np.abs(arr) / linthresh)),
+    )
+    return out.tolist()
+
+
+def symlog_ticks(
+    linthresh: float = 10.0,
+    decades: int = 4,
+    linear_frac: float = 0.6,
+) -> tuple[list[float], list[str]]:
+    """
+    Generate tick positions and labels for a symlog axis.
+
+    Parameters
+    ----------
+    linthresh
+        Linear threshold matching :func:`symlog_transform`.
+    decades
+        Number of decades to show on each side of zero.
+    linear_frac
+        Must match the value passed to :func:`symlog_transform`.
+
+    Returns
+    -------
+    tuple[list[float], list[str]]
+        Tick values (in transformed space) and their display labels.
+    """
+    ticks_val: list[float] = []
+    ticks_txt: list[str] = []
+
+    kw = {"linthresh": linthresh, "linear_frac": linear_frac, "decades": decades}
+
+    for d in range(decades, 0, -1):
+        raw = -(linthresh * 10 ** d)
+        ticks_val.append(symlog_transform([raw], **kw)[0])
+        ticks_txt.append(f"{raw:.0e}")
+
+    for v in [-linthresh, -linthresh / 2, 0, linthresh / 2, linthresh]:
+        ticks_val.append(symlog_transform([v], **kw)[0])
+        ticks_txt.append(f"{v:g}")
+
+    for d in range(1, decades + 1):
+        raw = linthresh * 10 ** d
+        ticks_val.append(symlog_transform([raw], **kw)[0])
+        ticks_txt.append(f"{raw:.0e}")
+
+    return ticks_val, ticks_txt
+
+
+def apply_symlog_yaxis(
+    fig: go.Figure,
+    *,
+    linthresh: float = 10.0,
+    decades: int = 4,
+    linear_frac: float = 0.6,
+    title_text: str = "",
+    row: int | None = None,
+    col: int | None = None,
+) -> None:
+    """
+    Apply symlog tick formatting to a y-axis of the given figure.
+
+    Parameters
+    ----------
+    fig
+        Plotly figure to modify *in place*.
+    linthresh
+        Linear threshold for the symlog transform.
+    decades
+        Number of log decades on each side.
+    linear_frac
+        Fraction of axis devoted to the linear region.
+    title_text
+        Y-axis title.
+    row, col
+        Subplot coordinates (passed through to ``fig.update_yaxes``).
+    """
+    tick_vals, tick_text = symlog_ticks(linthresh, decades, linear_frac)
+    kwargs: dict[str, Any] = {
+        "tickvals": tick_vals,
+        "ticktext": tick_text,
+        "title_text": title_text,
+    }
+    if row is not None:
+        kwargs["row"] = row
+    if col is not None:
+        kwargs["col"] = col
+    fig.update_yaxes(**kwargs)
+
+
 def figure_from_dict(
     figure_dict: Mapping | None, fallback_title: str | None = None
 ) -> go.Figure:
